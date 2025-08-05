@@ -39,3 +39,4 @@ This script provides a smooth, customizable vehicle color fading system for Five
 ---
 
 This script was made to mess with my friend in a private server im not too sure how well it will work nor how laggy it is (Even tho its worked fine for me so far just want to make a disclamer incase lol)
+I may update it in the future maybe not we'll see...
