@@ -92,6 +92,10 @@ local function IsPlayerWhitelisted(src)
     return false
 end
 
+local function sendFadeResult(src, ok, netID, isFaded, targetColorIndex, reason)
+    TriggerClientEvent("colorfade:requestResult", src, ok, netID or 0, isFaded == true, reason or "", targetColorIndex or -1)
+end
+
 RegisterNetEvent("colorfade:checkWhitelist")
 AddEventHandler("colorfade:checkWhitelist", function()
     local src = source
@@ -105,20 +109,24 @@ AddEventHandler("colorfade:requestFade", function(netID, targetColorIndex, origD
     local src = source
 
     if not IsPlayerWhitelisted(src) then
+        sendFadeResult(src, false, netID, false, targetColorIndex, "not_authorized")
         return
     end
 
     local playerVehNetId, reason = getPlayerVehicleNetIdIfAuthorized(src)
     if not playerVehNetId then
+        sendFadeResult(src, false, netID, false, targetColorIndex, reason or "not_ready")
         return
     end
 
     netID = tonumber(netID)
     if not netID or math.floor(netID) ~= playerVehNetId then
+        sendFadeResult(src, false, netID, false, targetColorIndex, "not_ready")
         return
     end
 
     if not isValidColorIndex(targetColorIndex) then
+        sendFadeResult(src, false, netID, false, targetColorIndex, "bad_color")
         return
     end
     targetColorIndex = math.floor(tonumber(targetColorIndex))
@@ -143,6 +151,7 @@ AddEventHandler("colorfade:requestFade", function(netID, targetColorIndex, origD
             }
         })
         fadedVehicles[netID] = nil
+        sendFadeResult(src, true, netID, false, targetColorIndex)
     else
         local safeOrig = sanitizeOrigData(origData)
         fadedVehicles[netID] = safeOrig
@@ -159,6 +168,7 @@ AddEventHandler("colorfade:requestFade", function(netID, targetColorIndex, origD
                 customColor = nil
             }
         })
+        sendFadeResult(src, true, netID, true, targetColorIndex)
     end
 end)
 
@@ -168,16 +178,19 @@ AddEventHandler("colorfade:requestFadeRGB", function(netID, r, g, b, origData)
     local src = source
 
     if not IsPlayerWhitelisted(src) then
+        sendFadeResult(src, false, netID, false, nil, "not_authorized")
         return
     end
 
-    local playerVehNetId = getPlayerVehicleNetIdIfAuthorized(src)
+    local playerVehNetId, reason = getPlayerVehicleNetIdIfAuthorized(src)
     if not playerVehNetId then
+        sendFadeResult(src, false, netID, false, nil, reason or "not_ready")
         return
     end
 
     netID = tonumber(netID)
     if not netID or math.floor(netID) ~= playerVehNetId then
+        sendFadeResult(src, false, netID, false, nil, "not_ready")
         return
     end
 
@@ -203,6 +216,7 @@ AddEventHandler("colorfade:requestFadeRGB", function(netID, r, g, b, origData)
             }
         })
         fadedVehicles[netID] = nil
+        sendFadeResult(src, true, netID, false, nil)
     else
         local safeOrig = sanitizeOrigData(origData)
         fadedVehicles[netID] = safeOrig
@@ -219,6 +233,7 @@ AddEventHandler("colorfade:requestFadeRGB", function(netID, r, g, b, origData)
                 customColor = { r, g, b }
             }
         })
+        sendFadeResult(src, true, netID, true, nil)
     end
 end)
 
@@ -228,7 +243,12 @@ CreateThread(function()
         local ttl = Config.FadeStateTTLSeconds or 600
         local cutoff = nowSeconds() - ttl
         for netId, data in pairs(fadedVehicles) do
-            if type(data) ~= "table" or type(data.ts) ~= "number" or data.ts < cutoff then
+            local veh = NetworkGetEntityFromNetworkId(netId)
+            if type(data) ~= "table" then
+                fadedVehicles[netId] = nil
+            elseif veh and veh ~= 0 and DoesEntityExist(veh) then
+                data.ts = nowSeconds()
+            elseif type(data.ts) ~= "number" or data.ts < cutoff then
                 fadedVehicles[netId] = nil
             end
         end

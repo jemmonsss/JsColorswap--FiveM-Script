@@ -8,8 +8,11 @@ Config.EnableSync = true
 Config.RequireDriverSeat = true
 
 -- Fade behavior
-Config.FadeDurationMs = 2500
-Config.FadeStepMs = 15
+Config.FadeDurationMs = 3500
+Config.FadeStepMs = 20
+Config.FadeCyberpunkStyle = true
+Config.FadePulseStrength = 0.28
+Config.FadeNeonGlow = true
 
 -- Server-side safety: how long to keep per-vehicle fade state (seconds)
 Config.FadeStateTTLSeconds = 10 * 60

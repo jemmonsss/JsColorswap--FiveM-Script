@@ -1,7 +1,5 @@
 local isWhitelisted = false
 local selectedColorIndex = 0
-local isMenuOpen = false
-local menuCur = 1
 
 local keybinds = {
     colorfade_menu = "F7",
@@ -13,7 +11,9 @@ local function GetKeyMappingDisplayName(command)
     return keybinds[command] or "Unbound"
 end
 
-local originalColors = {} -- Store original colors per vehicle entity
+local originalColors = {} -- Store original colors per vehicle key
+local activeFadeTokens = {}
+local pendingFadeRequests = {}
 
 -- Full GTA color data table with RGB
 local GtaColorList = {
@@ -107,7 +107,30 @@ local function GetColorRGB(colorIndex)
     if c and c.rgb then
         return c.rgb[1], c.rgb[2], c.rgb[3]
     end
-    return 255, 255, 255
+    return 0, 0, 0
+end
+
+local function GetColorName(colorIndex)
+    local c = GtaColorList[colorIndex]
+    return (c and c.name) or ("ID " .. tostring(colorIndex))
+end
+
+local function clamp255(n)
+    n = tonumber(n) or 0
+    n = math.floor(n)
+    if n < 0 then return 0 end
+    if n > 255 then return 255 end
+    return n
+end
+
+local function lerp(a, b, t)
+    return a + ((b - a) * t)
+end
+
+local function smoothStep(t)
+    if t < 0 then return 0 end
+    if t > 1 then return 1 end
+    return t * t * (3 - (2 * t))
 end
 
 local function clampColorIndex(idx)
@@ -119,14 +142,37 @@ local function clampColorIndex(idx)
     return idx
 end
 
+local function normalizeMenuColorIndex(idx, fallback)
+    idx = clampColorIndex(idx)
+    if GtaColorList[idx] then
+        return idx
+    end
+
+    fallback = clampColorIndex(fallback or selectedColorIndex or 0)
+    if GtaColorList[fallback] then
+        return fallback
+    end
+
+    return colorIdxs[1] or 0
+end
+
+local function GetColorRGBOrFallback(colorIndex, fallbackR, fallbackG, fallbackB)
+    local c = GtaColorList[colorIndex]
+    if c and c.rgb then
+        return c.rgb[1], c.rgb[2], c.rgb[3]
+    end
+    return fallbackR or 0, fallbackG or 0, fallbackB or 0
+end
+
 local function GetVehiclePrimaryColourSafe(vehicle)
     if vehicle == 0 or not DoesEntityExist(vehicle) then
         return 0 -- default color black
     end
     local success, primaryColour = pcall(function()
-        return GetVehiclePrimaryColour(vehicle)
+        local primary = GetVehicleColours(vehicle)
+        return primary
     end)
-    if success and primaryColour then
+    if success and primaryColour ~= nil then
         return primaryColour
     else
         return 0
@@ -138,9 +184,10 @@ local function GetVehicleSecondaryColourSafe(vehicle)
         return 0
     end
     local success, secondaryColour = pcall(function()
-        return GetVehicleSecondaryColour(vehicle)
+        local _, secondary = GetVehicleColours(vehicle)
+        return secondary
     end)
-    if success and secondaryColour then
+    if success and secondaryColour ~= nil then
         return secondaryColour
     else
         return 0
@@ -174,6 +221,132 @@ local function GetVehicleColoursSafe(vehicle)
     return 0, 0
 end
 
+local function MakeVehicleEntityKey(vehicle)
+    return ("entity:%d"):format(vehicle or 0)
+end
+
+local function MakeVehicleNetKey(netId)
+    return ("net:%d"):format(netId or 0)
+end
+
+local function EnsureVehicleNetId(vehicle, timeoutMs)
+    if vehicle == 0 or not DoesEntityExist(vehicle) then
+        return nil
+    end
+
+    local timeoutAt = GetGameTimer() + (timeoutMs or 0)
+
+    repeat
+        if not NetworkGetEntityIsNetworked(vehicle) then
+            NetworkRegisterEntityAsNetworked(vehicle)
+        end
+
+        if NetworkGetEntityIsNetworked(vehicle) then
+            local netId = NetworkGetNetworkIdFromEntity(vehicle)
+            if netId and netId ~= 0 then
+                return netId
+            end
+        end
+
+        if GetGameTimer() >= timeoutAt then
+            break
+        end
+
+        Wait(0)
+    until false
+
+    return nil
+end
+
+local function GetExistingVehicleNetId(vehicle)
+    if vehicle == 0 or not DoesEntityExist(vehicle) then
+        return nil
+    end
+    if not NetworkGetEntityIsNetworked(vehicle) then
+        return nil
+    end
+    local netId = NetworkGetNetworkIdFromEntity(vehicle)
+    if netId and netId ~= 0 then
+        return netId
+    end
+    return nil
+end
+
+local function GetVehicleStateKey(vehicle, netId)
+    if netId then
+        return MakeVehicleNetKey(netId)
+    end
+
+    local existingNetId = GetExistingVehicleNetId(vehicle)
+    if existingNetId then
+        return MakeVehicleNetKey(existingNetId), existingNetId
+    end
+
+    return MakeVehicleEntityKey(vehicle), nil
+end
+
+local function CaptureOriginalColor(vehicle, key, netId, targetColorIndex)
+    local hasCustomColor = GetIsVehiclePrimaryColourCustom(vehicle)
+    local customR, customG, customB = GetVehicleCustomPrimaryColour(vehicle)
+    local primaryIndex = GetVehiclePrimaryColourSafe(vehicle)
+    local secondaryIndex = GetVehicleSecondaryColourSafe(vehicle)
+    local pearlescentIndex, wheelColor = GetVehicleExtraColoursSafe(vehicle)
+
+    return {
+        key = key,
+        entity = vehicle,
+        netId = netId,
+        ts = GetGameTimer(),
+        hasCustom = hasCustomColor,
+        customColor = {customR, customG, customB},
+        primaryIndex = primaryIndex,
+        secondaryIndex = secondaryIndex,
+        pearlescentIndex = pearlescentIndex,
+        wheelColor = wheelColor,
+        targetColorIndex = normalizeMenuColorIndex(targetColorIndex, selectedColorIndex),
+        isFaded = false
+    }
+end
+
+local function GetSavedOriginalColor(vehicle, netId)
+    local key = GetVehicleStateKey(vehicle, netId)
+    local entityKey = MakeVehicleEntityKey(vehicle)
+    local saved = originalColors[key]
+
+    if not saved and key ~= entityKey then
+        saved = originalColors[entityKey]
+        if saved then
+            originalColors[key] = saved
+            originalColors[entityKey] = nil
+        end
+    end
+
+    if saved then
+        saved.key = key
+        saved.entity = vehicle
+        saved.netId = netId or saved.netId
+        saved.ts = GetGameTimer()
+    end
+
+    return saved, key
+end
+
+local function SetSavedVehicleTargetColor(vehicle, colorIndex)
+    if vehicle == 0 or not DoesEntityExist(vehicle) then
+        return
+    end
+
+    local netId = GetExistingVehicleNetId(vehicle)
+    local saved, key = GetSavedOriginalColor(vehicle, netId)
+    if not saved then
+        saved = CaptureOriginalColor(vehicle, key, netId, colorIndex)
+        originalColors[key] = saved
+    end
+
+    saved.targetColorIndex = normalizeMenuColorIndex(colorIndex)
+    saved.ts = GetGameTimer()
+end
+
 local function EnsureEntityControl(entity, timeoutMs)
     if entity == 0 or not DoesEntityExist(entity) then
         return false
@@ -204,27 +377,155 @@ local function GetVisiblePrimaryRGB(vehicle)
     return GetColorRGB(primaryIdx)
 end
 
+local function CaptureVehicleNeonState(veh)
+    if (Config and Config.FadeNeonGlow) == false then
+        return nil
+    end
+
+    local okColor, r, g, b = pcall(function()
+        return GetVehicleNeonLightsColour(veh)
+    end)
+    if not okColor then
+        return nil
+    end
+
+    local state = {
+        color = { r or 255, g or 255, b or 255 },
+        enabled = {}
+    }
+
+    for i = 0, 3 do
+        local okEnabled, enabled = pcall(function()
+            return IsVehicleNeonLightEnabled(veh, i)
+        end)
+        state.enabled[i] = okEnabled and enabled == true
+    end
+
+    return state
+end
+
+local function SetFadeNeon(veh, r, g, b)
+    if (Config and Config.FadeNeonGlow) == false then
+        return
+    end
+
+    pcall(function()
+        for i = 0, 3 do
+            SetVehicleNeonLightEnabled(veh, i, true)
+        end
+        SetVehicleNeonLightsColour(veh, clamp255(r), clamp255(g), clamp255(b))
+    end)
+end
+
+local function RestoreVehicleNeonState(veh, state)
+    if not state or veh == 0 or not DoesEntityExist(veh) then
+        return
+    end
+
+    pcall(function()
+        for i = 0, 3 do
+            SetVehicleNeonLightEnabled(veh, i, state.enabled[i] == true)
+        end
+        SetVehicleNeonLightsColour(veh, state.color[1] or 255, state.color[2] or 255, state.color[3] or 255)
+    end)
+end
+
+local function GetCyberpunkFadeRGB(fromP, toP, t, now, startTime)
+    local eased = smoothStep(t)
+    local r = lerp(fromP[1], toP[1], eased)
+    local g = lerp(fromP[2], toP[2], eased)
+    local b = lerp(fromP[3], toP[3], eased)
+
+    if (Config and Config.FadeCyberpunkStyle) == false then
+        return clamp255(r), clamp255(g), clamp255(b)
+    end
+
+    local elapsed = now - startTime
+    local envelope = math.sin(t * math.pi)
+    local pulse = ((math.sin(elapsed / 70) + 1) * 0.5) ^ 2
+    local glitch = ((math.floor(elapsed / 115) % 6) == 0) and 0.35 or 0
+    local amount = ((Config and Config.FadePulseStrength) or 0.28) * envelope * (pulse + glitch)
+
+    if amount > 0 then
+        local useCyan = (math.floor(elapsed / 180) % 2) == 0
+        local accentR = useCyan and 0 or 255
+        local accentG = useCyan and 245 or 20
+        local accentB = useCyan and 255 or 210
+
+        accentR = lerp(toP[1], accentR, 0.55)
+        accentG = lerp(toP[2], accentG, 0.55)
+        accentB = lerp(toP[3], accentB, 0.55)
+
+        r = lerp(r, accentR, amount)
+        g = lerp(g, accentG, amount)
+        b = lerp(b, accentB, amount)
+    end
+
+    return clamp255(r), clamp255(g), clamp255(b)
+end
+
 local function FadeVehicle(veh, fromP, toP)
+    local fadeKey = GetVehicleStateKey(veh)
+    activeFadeTokens[fadeKey] = (activeFadeTokens[fadeKey] or 0) + 1
+    local token = activeFadeTokens[fadeKey]
+
     local startTime = GetGameTimer()
     local duration = (Config and Config.FadeDurationMs) or 2500
     local step = (Config and Config.FadeStepMs) or 15
+    local neonState = CaptureVehicleNeonState(veh)
 
     while GetGameTimer() < startTime + duration do
+        if activeFadeTokens[fadeKey] ~= token then
+            return false
+        end
         if veh == 0 or not DoesEntityExist(veh) then
-            return
+            return false
         end
         local now = GetGameTimer()
         local t = (now - startTime) / duration
 
-        local r = math.floor(fromP[1] + (toP[1] - fromP[1]) * t)
-        local g = math.floor(fromP[2] + (toP[2] - fromP[2]) * t)
-        local b = math.floor(fromP[3] + (toP[3] - fromP[3]) * t)
+        local r, g, b = GetCyberpunkFadeRGB(fromP, toP, t, now, startTime)
 
         SetVehicleCustomPrimaryColour(veh, r, g, b)
+        SetFadeNeon(veh, r, g, b)
         Wait(step)
     end
 
+    if activeFadeTokens[fadeKey] ~= token then
+        return false
+    end
+
     SetVehicleCustomPrimaryColour(veh, toP[1], toP[2], toP[3])
+    Wait(120)
+    if activeFadeTokens[fadeKey] ~= token then
+        return false
+    end
+
+    RestoreVehicleNeonState(veh, neonState)
+    activeFadeTokens[fadeKey] = nil
+    return true
+end
+
+local function ApplyVehiclePaintState(veh, primaryIdx, secondaryIdx, pearlescentIdx, wheelIdx, hasCustom, customColor)
+    if veh == 0 or not DoesEntityExist(veh) then
+        return
+    end
+
+    primaryIdx = clampColorIndex(primaryIdx or 0)
+    secondaryIdx = clampColorIndex(secondaryIdx or 0)
+    pearlescentIdx = clampColorIndex(pearlescentIdx or 0)
+    wheelIdx = clampColorIndex(wheelIdx or 0)
+
+    if hasCustom and type(customColor) == "table" then
+        SetVehicleColours(veh, primaryIdx, secondaryIdx)
+        SetVehicleExtraColours(veh, pearlescentIdx, wheelIdx)
+        SetVehicleCustomPrimaryColour(veh, customColor[1] or 0, customColor[2] or 0, customColor[3] or 0)
+    else
+        ClearVehicleCustomPrimaryColour(veh)
+        SetVehicleColours(veh, primaryIdx, secondaryIdx)
+        SetVehicleExtraColours(veh, pearlescentIdx, wheelIdx)
+        ClearVehicleCustomPrimaryColour(veh)
+    end
 end
 
 local function DrawText(x, y, text, scale, r, g, b)
@@ -282,6 +583,55 @@ local function playMenuSound(soundName)
         return
     end
     PlaySoundFrontend(-1, soundName, soundSet, true)
+end
+
+local menuControls = {
+    fast = { 21 }, -- SHIFT
+    up = { 172, 188, 241 },
+    down = { 173, 187, 242 },
+    catPrev = { 44, 174, 189, 205 },
+    catNext = { 38, 175, 190, 206 },
+    select = { 176, 191, 201 },
+    back = { 177, 194, 202 }
+}
+
+local menuControlGroups = { 0, 2 }
+
+local menuControlBlocklist = {
+    21, 38, 44,
+    172, 173, 174, 175, 176, 177,
+    187, 188, 189, 190, 191, 194,
+    201, 202, 205, 206, 241, 242
+}
+
+local function disableMenuControls()
+    for _, group in ipairs(menuControlGroups) do
+        for _, control in ipairs(menuControlBlocklist) do
+            DisableControlAction(group, control, true)
+        end
+    end
+end
+
+local function isAnyMenuControlPressed(controls)
+    for _, group in ipairs(menuControlGroups) do
+        for _, control in ipairs(controls) do
+            if IsControlPressed(group, control) or IsDisabledControlPressed(group, control) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function isAnyMenuControlJustPressed(controls)
+    for _, group in ipairs(menuControlGroups) do
+        for _, control in ipairs(controls) do
+            if IsControlJustPressed(group, control) or IsDisabledControlJustPressed(group, control) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 local menuState = {
@@ -420,6 +770,9 @@ local function OpenMenu()
         notify("~r~You are not authorized to use ColorFade.")
         return
     end
+    if menuState.open then
+        return
+    end
 
     menuState.open = true
     menuState.closing = false
@@ -438,6 +791,22 @@ local function OpenMenu()
     playMenuSound((Config and Config.MenuSoundOpen) or "SELECT")
 
     local categories = buildMenuCategories()
+    local ped = PlayerPedId()
+    local veh = GetVehiclePedIsIn(ped, false)
+    if veh ~= 0 and DoesEntityExist(veh) then
+        local saved = GetSavedOriginalColor(veh, GetExistingVehicleNetId(veh))
+        if saved and saved.targetColorIndex then
+            selectedColorIndex = normalizeMenuColorIndex(saved.targetColorIndex)
+            local allColors = categories[1] and categories[1].indices or {}
+            for i, colorIndex in ipairs(allColors) do
+                if colorIndex == selectedColorIndex then
+                    menuState.cur = i
+                    menuState.top = math.max(1, i - math.floor(menuState.pageSize / 2))
+                    break
+                end
+            end
+        end
+    end
 
     Citizen.CreateThread(function()
         while menuState.open do
@@ -464,16 +833,19 @@ local function OpenMenu()
                 menuState.previewRestore = captureVehiclePreviewRestore(veh)
             end
 
+            disableMenuControls()
+
             -- Inputs (support both keyboard and GTA frontend controls)
-            local accel = IsControlPressed(0, 21) -- SHIFT
+            local inputsLocked = menuState.closing == true
+            local accel = isAnyMenuControlPressed(menuControls.fast)
             local step = accel and 10 or 1
 
-            local up = IsControlJustPressed(0, 172) or IsControlJustPressed(0, 241) or IsControlJustPressed(0, 188) -- UP
-            local down = IsControlJustPressed(0, 173) or IsControlJustPressed(0, 242) or IsControlJustPressed(0, 187) -- DOWN
-            local catPrev = IsControlJustPressed(0, 44) or IsControlJustPressed(0, 189) -- Q / FRONTEND_LEFT
-            local catNext = IsControlJustPressed(0, 38) or IsControlJustPressed(0, 190) -- E / FRONTEND_RIGHT
-            local select = IsControlJustPressed(0, 191) or IsControlJustPressed(0, 201) -- ENTER / FRONTEND_ACCEPT
-            local back = IsControlJustPressed(0, 194) or IsControlJustPressed(0, 202) -- ESC / FRONTEND_CANCEL
+            local up = (not inputsLocked) and isAnyMenuControlJustPressed(menuControls.up)
+            local down = (not inputsLocked) and isAnyMenuControlJustPressed(menuControls.down)
+            local catPrev = (not inputsLocked) and isAnyMenuControlJustPressed(menuControls.catPrev)
+            local catNext = (not inputsLocked) and isAnyMenuControlJustPressed(menuControls.catNext)
+            local select = (not inputsLocked) and isAnyMenuControlJustPressed(menuControls.select)
+            local back = (not inputsLocked) and isAnyMenuControlJustPressed(menuControls.back)
 
             local enableCats = (Config and Config.MenuEnableCategories) ~= false
             local activeCategory = categories[menuState.category] or categories[1]
@@ -529,8 +901,9 @@ local function OpenMenu()
             elseif select then
                 playMenuSound((Config and Config.MenuSoundSelect) or "SELECT")
                 if total > 0 then
-                    selectedColorIndex = activeList[menuState.cur]
-                    notify("~g~Selected: " .. (GtaColorList[selectedColorIndex].name or ("ID " .. selectedColorIndex)))
+                    selectedColorIndex = normalizeMenuColorIndex(activeList[menuState.cur])
+                    SetSavedVehicleTargetColor(veh, selectedColorIndex)
+                    notify("~g~Selected: " .. GetColorName(selectedColorIndex))
                 end
                 menuState.closing = true
                 menuState.animStart = GetGameTimer()
@@ -708,6 +1081,11 @@ local function OpenMenu()
 end
 
 local function SaveOriginalColor()
+    if not isWhitelisted then
+        notify("~r~You are not authorized to use ColorFade.")
+        return
+    end
+
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
     if veh == 0 or not DoesEntityExist(veh) then
@@ -715,23 +1093,27 @@ local function SaveOriginalColor()
         return
     end
 
-    local hasCustomColor = GetIsVehiclePrimaryColourCustom(veh)
-    local customR, customG, customB = GetVehicleCustomPrimaryColour(veh)
-    local primaryIndex = GetVehiclePrimaryColourSafe(veh)
-    local secondaryIndex = GetVehicleSecondaryColourSafe(veh)
-    local pearlescentIndex, wheelColor = GetVehicleExtraColoursSafe(veh)
+    if Config and Config.RequireDriverSeat then
+        if GetPedInVehicleSeat(veh, -1) ~= ped then
+            notify("~r~You must be the driver to use this.")
+            return
+        end
+    end
 
-    originalColors[veh] = {
-        hasCustom = hasCustomColor,
-        customColor = {customR, customG, customB},
-        primaryIndex = primaryIndex,
-        secondaryIndex = secondaryIndex,
-        pearlescentIndex = pearlescentIndex,
-        wheelColor = wheelColor,
-        isFaded = false
-    }
+    local netId = nil
+    if Config and Config.EnableSync then
+        netId = EnsureVehicleNetId(veh, 1500)
+        if not netId then
+            notify("~y~Vehicle is still getting ready. Try again in a moment.")
+            return
+        end
+    end
 
-    notify("~g~Original color saved!")
+    local existing, key = GetSavedOriginalColor(veh, netId)
+    local targetColorIndex = normalizeMenuColorIndex(existing and existing.targetColorIndex or selectedColorIndex)
+    originalColors[key] = CaptureOriginalColor(veh, key, netId, targetColorIndex)
+
+    notify(("~g~Original saved for this vehicle. Fade color: %s"):format(GetColorName(targetColorIndex)))
 end
 
 local function ToggleFade()
@@ -747,14 +1129,6 @@ local function ToggleFade()
         return
     end
 
-    if originalColors[veh] == nil then
-        local saveKey = GetKeyMappingDisplayName("colorfade_savecolor")
-        notify(("~y~No original color saved! Press %s to save current color first."):format(saveKey))
-        return
-    end
-
-    local orig = originalColors[veh]
-
     if Config and Config.RequireDriverSeat then
         if GetPedInVehicleSeat(veh, -1) ~= ped then
             notify("~r~You must be the driver to use this.")
@@ -762,20 +1136,52 @@ local function ToggleFade()
         end
     end
 
-    selectedColorIndex = clampColorIndex(selectedColorIndex)
+    selectedColorIndex = normalizeMenuColorIndex(selectedColorIndex)
 
-    if Config and Config.EnableSync then
-        if not NetworkGetEntityIsNetworked(veh) then
-            NetworkRegisterEntityAsNetworked(veh)
-        end
-        local netId = NetworkGetNetworkIdFromEntity(veh)
-        if not netId or netId == 0 then
-            notify("~r~Unable to sync this vehicle (no network id).")
+    local syncEnabled = Config and Config.EnableSync
+    local netId = nil
+
+    if syncEnabled then
+        netId = EnsureVehicleNetId(veh, 2000)
+        if not netId then
+            notify("~y~Vehicle is still getting ready. Try again in a moment.")
             return
         end
 
+        if not EnsureEntityControl(veh, 1000) then
+            notify("~y~Vehicle control is still getting ready. Try again in a moment.")
+            return
+        end
+
+        if pendingFadeRequests[netId] then
+            notify("~y~Fade is already starting for this vehicle.")
+            return
+        end
+    end
+
+    local orig, vehicleKey = GetSavedOriginalColor(veh, netId)
+    if not orig then
+        orig = CaptureOriginalColor(veh, vehicleKey, netId, selectedColorIndex)
+        originalColors[vehicleKey] = orig
+    end
+
+    if not orig.targetColorIndex then
+        orig.targetColorIndex = normalizeMenuColorIndex(selectedColorIndex)
+    end
+
+    local targetColorIndex = normalizeMenuColorIndex(orig.targetColorIndex, selectedColorIndex)
+    orig.targetColorIndex = targetColorIndex
+    selectedColorIndex = targetColorIndex
+
+    if syncEnabled then
         -- Server tracks toggle state per netId and broadcasts fade.
-        TriggerServerEvent("colorfade:requestFade", netId, selectedColorIndex, {
+        pendingFadeRequests[netId] = {
+            key = vehicleKey,
+            targetColorIndex = targetColorIndex,
+            ts = GetGameTimer()
+        }
+
+        TriggerServerEvent("colorfade:requestFade", netId, targetColorIndex, {
             hasCustom = orig.hasCustom,
             customColor = orig.customColor,
             primaryIndex = orig.primaryIndex,
@@ -784,12 +1190,6 @@ local function ToggleFade()
             wheelColor = orig.wheelColor
         })
 
-        orig.isFaded = not orig.isFaded
-        if orig.isFaded then
-            notify(("~g~Fading to color: %s"):format(GtaColorList[selectedColorIndex].name or selectedColorIndex))
-        else
-            notify("~g~Restoring original vehicle color...")
-        end
         return
     end
 
@@ -801,52 +1201,86 @@ local function ToggleFade()
         if orig.hasCustom then
             toR, toG, toB = table.unpack(orig.customColor)
         else
-            toR, toG, toB = GetColorRGB(orig.primaryIndex)
+            toR, toG, toB = GetColorRGBOrFallback(orig.primaryIndex, fromR, fromG, fromB)
         end
 
         Citizen.CreateThread(function()
-            FadeVehicle(veh, {fromR, fromG, fromB}, {toR, toG, toB})
+            if not FadeVehicle(veh, {fromR, fromG, fromB}, {toR, toG, toB}) then
+                return
+            end
 
             if DoesEntityExist(veh) then
                 -- Restore original preset colors
-                SetVehicleColours(veh, orig.primaryIndex, orig.secondaryIndex)
-                SetVehicleExtraColours(veh, orig.pearlescentIndex, orig.wheelColor)
-
-                if orig.hasCustom then
-                    SetVehicleCustomPrimaryColour(veh, toR, toG, toB)
-                else
-                    ClearVehicleCustomPrimaryColour(veh)
-                end
+                ApplyVehiclePaintState(veh, orig.primaryIndex, orig.secondaryIndex, orig.pearlescentIndex, orig.wheelColor,
+                    orig.hasCustom, orig.hasCustom and { toR, toG, toB } or nil)
             end
         end)
 
-        originalColors[veh].isFaded = false
+        orig.isFaded = false
         notify("~g~Restoring original vehicle color...")
 
     else
         -- Fade to selected color
         local fromR, fromG, fromB = GetVisiblePrimaryRGB(veh)
-        local toR, toG, toB = GetColorRGB(selectedColorIndex)
+        local toR, toG, toB = GetColorRGBOrFallback(targetColorIndex, fromR, fromG, fromB)
 
         Citizen.CreateThread(function()
-            FadeVehicle(veh, {fromR, fromG, fromB}, {toR, toG, toB})
+            if not FadeVehicle(veh, {fromR, fromG, fromB}, {toR, toG, toB}) then
+                return
+            end
 
             if DoesEntityExist(veh) then
                 -- Set primary to selected color, keep original secondary
-                SetVehicleColours(veh, selectedColorIndex, orig.secondaryIndex)
-
-                -- Remove pearlescent color (set to 0) when fading to a new color
-                SetVehicleExtraColours(veh, 0, orig.wheelColor)
-
-                -- Set custom primary color for the visible fade effect
-                SetVehicleCustomPrimaryColour(veh, toR, toG, toB)
+                ApplyVehiclePaintState(veh, targetColorIndex, orig.secondaryIndex, 0, orig.wheelColor, false, nil)
             end
         end)
 
-        originalColors[veh].isFaded = true
-        notify(("~g~Fading to color: %s"):format(GtaColorList[selectedColorIndex].name or selectedColorIndex))
+        orig.isFaded = true
+        notify(("~g~Fading to color: %s"):format(GetColorName(targetColorIndex)))
     end
 end
+
+RegisterNetEvent("colorfade:requestResult", function(ok, netID, isFaded, reason, targetColorIndex)
+    netID = tonumber(netID) or 0
+    if reason == "" then
+        reason = nil
+    end
+    if targetColorIndex == -1 then
+        targetColorIndex = nil
+    end
+
+    local pending = pendingFadeRequests[netID]
+    if pending then
+        pendingFadeRequests[netID] = nil
+    end
+
+    if not ok then
+        local message = "~r~Unable to fade this vehicle."
+        if reason == "not_ready" or reason == "no_vehicle" or reason == "no_netid" then
+            message = "~y~Vehicle is still getting ready. Try again in a moment."
+        elseif reason == "not_driver" then
+            message = "~r~You must be the driver to use this."
+        elseif reason == "not_authorized" then
+            message = "~r~You are not authorized to use ColorFade."
+        end
+        notify(message)
+        return
+    end
+
+    local key = pending and pending.key or MakeVehicleNetKey(netID)
+    local orig = originalColors[key]
+    if orig then
+        orig.isFaded = isFaded == true
+        orig.targetColorIndex = normalizeMenuColorIndex(targetColorIndex or orig.targetColorIndex)
+        orig.ts = GetGameTimer()
+    end
+
+    if isFaded then
+        notify(("~g~Fading to color: %s"):format(GetColorName(targetColorIndex or (pending and pending.targetColorIndex) or selectedColorIndex)))
+    else
+        notify("~g~Restoring original vehicle color...")
+    end
+end)
 
 RegisterNetEvent("colorfade:applyState", function(netID, state)
     if type(state) ~= "table" then return end
@@ -855,7 +1289,7 @@ RegisterNetEvent("colorfade:applyState", function(netID, state)
     if veh == 0 or not DoesEntityExist(veh) then return end
 
     Citizen.CreateThread(function()
-        EnsureEntityControl(veh, 750)
+        EnsureEntityControl(veh, 1500)
 
         local fromR, fromG, fromB = GetVisiblePrimaryRGB(veh)
 
@@ -867,11 +1301,13 @@ RegisterNetEvent("colorfade:applyState", function(netID, state)
                 toB = tonumber(state.fadeTo.b) or toB
             elseif state.fadeTo.type == "index" then
                 local idx = clampColorIndex(state.fadeTo.value)
-                toR, toG, toB = GetColorRGB(idx)
+                toR, toG, toB = GetColorRGBOrFallback(idx, fromR, fromG, fromB)
             end
         end
 
-        FadeVehicle(veh, { fromR, fromG, fromB }, { toR, toG, toB })
+        if not FadeVehicle(veh, { fromR, fromG, fromB }, { toR, toG, toB }) then
+            return
+        end
         if veh == 0 or not DoesEntityExist(veh) then return end
 
         local apply = type(state.apply) == "table" and state.apply or {}
@@ -880,16 +1316,13 @@ RegisterNetEvent("colorfade:applyState", function(netID, state)
         local pearlIdx = clampColorIndex(apply.pearlescentIndex or 0)
         local wheelIdx = clampColorIndex(apply.wheelColor or 0)
 
-        SetVehicleColours(veh, primaryIdx, secondaryIdx)
-        SetVehicleExtraColours(veh, pearlIdx, wheelIdx)
-
         if apply.hasCustom and type(apply.customColor) == "table" then
             local r = tonumber(apply.customColor[1]) or toR
             local g = tonumber(apply.customColor[2]) or toG
             local b = tonumber(apply.customColor[3]) or toB
-            SetVehicleCustomPrimaryColour(veh, r, g, b)
+            ApplyVehiclePaintState(veh, primaryIdx, secondaryIdx, pearlIdx, wheelIdx, true, { r, g, b })
         else
-            ClearVehicleCustomPrimaryColour(veh)
+            ApplyVehiclePaintState(veh, primaryIdx, secondaryIdx, pearlIdx, wheelIdx, false, nil)
         end
     end)
 end)
@@ -899,17 +1332,18 @@ RegisterNetEvent("colorfade:applyFade", function(netID, toPrimaryColorIndex)
     local veh = NetworkGetEntityFromNetworkId(netID)
     if veh == 0 or not DoesEntityExist(veh) then return end
 
-    toPrimaryColorIndex = clampColorIndex(toPrimaryColorIndex)
+    toPrimaryColorIndex = normalizeMenuColorIndex(toPrimaryColorIndex)
 
     Citizen.CreateThread(function()
         local fromR, fromG, fromB = GetVisiblePrimaryRGB(veh)
-        local toR, toG, toB = GetColorRGB(toPrimaryColorIndex)
-        FadeVehicle(veh, {fromR, fromG, fromB}, {toR, toG, toB})
+        local toR, toG, toB = GetColorRGBOrFallback(toPrimaryColorIndex, fromR, fromG, fromB)
+        if not FadeVehicle(veh, {fromR, fromG, fromB}, {toR, toG, toB}) then
+            return
+        end
 
         if DoesEntityExist(veh) then
             local _, secondaryIdx = GetVehicleColoursSafe(veh)
-            SetVehicleColours(veh, toPrimaryColorIndex, secondaryIdx)
-            ClearVehicleCustomPrimaryColour(veh)
+            ApplyVehiclePaintState(veh, toPrimaryColorIndex, secondaryIdx, 0, 0, false, nil)
         end
     end)
 end)
@@ -920,7 +1354,9 @@ RegisterNetEvent("colorfade:applyFadeRGB", function(netID, r, g, b)
 
     Citizen.CreateThread(function()
         local fromR, fromG, fromB = GetVisiblePrimaryRGB(veh)
-        FadeVehicle(veh, {fromR, fromG, fromB}, {r, g, b})
+        if not FadeVehicle(veh, {fromR, fromG, fromB}, {r, g, b}) then
+            return
+        end
 
         if DoesEntityExist(veh) then
             SetVehicleCustomPrimaryColour(veh, r, g, b)
@@ -958,9 +1394,31 @@ RegisterKeyMapping("colorfade_savecolor", "Save Current Vehicle Color as Origina
 CreateThread(function()
     while true do
         Wait(30 * 1000)
-        for veh, _ in pairs(originalColors) do
-            if veh == 0 or not DoesEntityExist(veh) then
-                originalColors[veh] = nil
+        local now = GetGameTimer()
+        local ttlMs = ((Config and Config.FadeStateTTLSeconds) or 600) * 1000
+
+        for key, data in pairs(originalColors) do
+            if type(data) ~= "table" then
+                originalColors[key] = nil
+            elseif data.netId then
+                local veh = NetworkGetEntityFromNetworkId(data.netId)
+                if veh ~= 0 and DoesEntityExist(veh) then
+                    data.entity = veh
+                    data.missingSince = nil
+                else
+                    data.missingSince = data.missingSince or now
+                    if now - data.missingSince > ttlMs then
+                        originalColors[key] = nil
+                    end
+                end
+            elseif data.entity == 0 or not DoesEntityExist(data.entity) then
+                originalColors[key] = nil
+            end
+        end
+
+        for netId, pending in pairs(pendingFadeRequests) do
+            if type(pending) ~= "table" or not pending.ts or now - pending.ts > 10000 then
+                pendingFadeRequests[netId] = nil
             end
         end
     end
